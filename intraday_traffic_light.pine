@@ -1,0 +1,665 @@
+//@version=6
+strategy("Intraday Multi-Frame Traffic Light", overlay=true, process_orders_on_close=true, calc_on_every_tick=false, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
+
+// === Global Inputs ===
+// K棒：單根蠟燭；實體=|收盤−開盤|；上下細線＝影線。
+// 陽K：收盤 > 開盤；陰K：收盤 < 開盤。
+// 小陽K/小陰K：陽/陰K且實體不大，規則：實體 ≤ (高−低)×small_body_frac。
+// 站回/跌回：當根收盤跨越某條線（例：收盤由線下→線上＝站回）。
+// VWAP：自今日開盤累加到當前的量加權平均價（每日重置）。
+// 1R：入場價與初始止損之間的距離。
+// 金叉/死叉：短均線上穿/下穿長均線；本系統只作方向確認，不單獨當入場訊號。
+
+string tf_H1 = input.timeframe("60", "1H Timeframe")
+string tf_M15 = input.timeframe("15", "15m Timeframe")
+string tf_M5 = input.timeframe("5", "5m Timeframe")
+string tf_M1 = input.timeframe("1", "1m Timeframe")
+
+string ma_template = input.string("21/55", "MA Template", options=["21/55", "20/50", "19/50"], tooltip="提供預設方案：①21/55（去同步，預設）②20/50（教科書）③19/50（搶早高風險）")
+int ma_fast_len = input.int(9, "Fast EMA", minval=1)
+int ma_mid_len = switch ma_template
+    "20/50" => 20
+    "19/50" => 19
+    => 21
+int ma_slow_len = switch ma_template
+    "20/50" => 50
+    "19/50" => 50
+    => 55
+int ma_very_slow_len = input.int(200, "Very Slow MA (SMA)", minval=10)
+
+string vol_mode = input.string("prev2", "Volume Filter", options=["prev2", "3of5"], tooltip="量能過濾 prev2: 當前量 > 前兩根；3of5: 當前量大於近五根中至少三根")
+float rr_min = input.float(1.5, "RR 門檻", minval=0.1, step=0.1)
+float too_far_pct = input.float(1.0, "過遠判定 (%)", minval=0.1, step=0.1)
+float squeeze_pct = input.float(0.3, "15m 纏繞閾值 (%)", minval=0.05, step=0.05)
+bool use_ATR_buffer = input.bool(true, "止損緩衝使用 ATR14/4")
+float buffer_pct = input.float(0.2, "止損緩衝百分比", minval=0.01, step=0.01)
+int swing_len_5m = input.int(10, "擺動高低回看 (5m)", minval=1)
+float small_body_frac = input.float(0.5, "小實體比例", minval=0.05, maxval=1.0, step=0.05)
+int time_stop_bars = input.int(10, "時間止損 Bar 數", minval=1)
+float half_R = input.float(0.5, "時間止損 0.5R", minval=0.1, step=0.1)
+int lrc_len = input.int(100, "LRC 長度", minval=10)
+float lrc_mult = input.float(2.0, "LRC 倍數", minval=0.1, step=0.1)
+bool exit_on_close = input.bool(true, "通道破線收盤確認")
+string session_rth = input.session("0930-1600", "交易時段 (RTH)")
+int ib_minutes = input.int(60, "IB 分鐘數", minval=5)
+bool show_labels = input.bool(true, "顯示標籤")
+bool use_m1_trigger = input.bool(false, "啟用 1m 精細觸發")
+
+group_trade = "策略管理"
+bool enable_partial = input.bool(true, "啟用 1.5R 部分止盈", group=group_trade)
+float partial_tp_pct = input.float(50.0, "部分止盈比例 (%)", minval=0, maxval=100, step=5, group=group_trade)
+
+bool use_strategy = input.bool(false, "啟用策略下單", inline="MODE", tooltip="開啟後於綠/紅燈觸發當根收盤下單。預設僅顯示訊號。")
+
+// === UI & Visual Inputs ===
+group_ma = "均線 / VWAP"
+bool show_ma_fast = input.bool(true, "顯示 EMA" + str.tostring(ma_fast_len), group=group_ma)
+bool show_ma_mid = input.bool(true, "顯示 EMA" + str.tostring(ma_mid_len), group=group_ma)
+bool show_ma_slow = input.bool(true, "顯示 EMA" + str.tostring(ma_slow_len), group=group_ma)
+bool show_ma_very_slow = input.bool(true, "顯示 SMA" + str.tostring(ma_very_slow_len), group=group_ma)
+bool show_vwap = input.bool(true, "顯示 VWAP", group=group_ma)
+color color_ma_fast = input.color(color.teal, "EMA" + str.tostring(ma_fast_len) + " 色", group=group_ma)
+color color_ma_mid = input.color(color.orange, "EMA" + str.tostring(ma_mid_len) + " 色", group=group_ma)
+color color_ma_slow = input.color(color.new(color.blue, 0), "EMA" + str.tostring(ma_slow_len) + " 色", group=group_ma)
+color color_ma_very_slow = input.color(color.purple, "SMA" + str.tostring(ma_very_slow_len) + " 色", group=group_ma)
+color color_vwap = input.color(color.gray, "VWAP 色", group=group_ma)
+
+group_cross = "金叉 / 死叉"
+bool show_cross_icons = input.bool(true, "顯示金叉 / 死叉提示", group=group_cross)
+color color_cross_up = input.color(color.lime, "金叉圖示色", group=group_cross)
+color color_cross_dn = input.color(color.red, "死叉圖示色", group=group_cross)
+
+group_lrc = "趨勢通道"
+bool show_lrc = input.bool(true, "顯示 LRC 通道", group=group_lrc)
+color color_lrc_up = input.color(color.new(color.blue, 70), "上升通道色", group=group_lrc)
+color color_lrc_dn = input.color(color.new(color.purple, 70), "下降通道色", group=group_lrc)
+
+group_levels = "關鍵水平"
+bool show_pdh = input.bool(true, "顯示 PDH", group=group_levels)
+bool show_pdl = input.bool(true, "顯示 PDL", group=group_levels)
+bool show_onh = input.bool(true, "顯示 ONH", group=group_levels)
+bool show_onl = input.bool(true, "顯示 ONL", group=group_levels)
+bool show_ibh = input.bool(true, "顯示 IBH", group=group_levels)
+bool show_ibl = input.bool(true, "顯示 IBL", group=group_levels)
+color color_pdh = input.color(color.new(color.green, 0), "PDH 色", group=group_levels)
+color color_pdl = input.color(color.new(color.red, 0), "PDL 色", group=group_levels)
+color color_onh = input.color(color.new(color.blue, 0), "ONH 色", group=group_levels)
+color color_onl = input.color(color.new(color.orange, 0), "ONL 色", group=group_levels)
+color color_ibh = input.color(color.new(color.lime, 0), "IBH 色", group=group_levels)
+color color_ibl = input.color(color.new(color.maroon, 0), "IBL 色", group=group_levels)
+int level_linewidth = input.int(1, "水平線粗細", minval=1, maxval=4, group=group_levels)
+line_style_levels = input.string("solid", "線型", options=["solid", "dotted", "dashed"], group=group_levels)
+
+group_panel = "燈號面板"
+bool show_panel = input.bool(true, "顯示燈號面板", group=group_panel)
+color color_green_bg = input.color(color.new(color.green, 70), "綠燈背景", group=group_panel)
+color color_red_bg = input.color(color.new(color.red, 70), "紅燈背景", group=group_panel)
+color color_yellow_bg = input.color(color.new(color.yellow, 60), "黃燈背景", group=group_panel)
+
+// === Utility Functions ===
+f_security(src, string timeframe) => request.security(syminfo.tickerid, timeframe, src, lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+
+f_line_style(string styleName) => styleName == "dotted" ? line.style_dotted : styleName == "dashed" ? line.style_dashed : line.style_solid
+
+add_reason(string base, bool condition, string reason_text) => condition ? base : (base + reason_text + "\n")
+
+// === Higher Timeframe Data ===
+H1_close = f_security(close, tf_H1)
+H1_ema20 = f_security(ta.ema(close, 20), tf_H1)
+H1_sma200 = f_security(ta.sma(close, 200), tf_H1)
+H1_slope_up = H1_ema20 - nz(H1_ema20[1]) > 0
+H1_slope_down = H1_ema20 - nz(H1_ema20[1]) < 0
+H1_bull = H1_close > H1_sma200 and H1_slope_up
+H1_bear = H1_close < H1_sma200 and H1_slope_down
+
+M15_close = f_security(close, tf_M15)
+M15_ema_fast = f_security(ta.ema(close, ma_fast_len), tf_M15)
+M15_ema_mid = f_security(ta.ema(close, ma_mid_len), tf_M15)
+M15_ema_slow = f_security(ta.ema(close, ma_slow_len), tf_M15)
+M15_vwap = f_security(ta.vwap(hlc3), tf_M15)
+M15_order_up = M15_ema_fast > M15_ema_mid and M15_ema_mid > M15_ema_slow
+M15_order_down = M15_ema_fast < M15_ema_mid and M15_ema_mid < M15_ema_slow
+M15_spread_pct = (math.max(math.max(M15_ema_fast, M15_ema_mid), M15_ema_slow) - math.min(math.min(M15_ema_fast, M15_ema_mid), M15_ema_slow)) / M15_close * 100
+M15_squeeze = M15_spread_pct <= squeeze_pct
+M15_bull = M15_order_up and M15_close > M15_vwap and not M15_squeeze
+M15_bear = M15_order_down and M15_close < M15_vwap and not M15_squeeze
+
+M5_close = f_security(close, tf_M5)
+M5_high = f_security(high, tf_M5)
+M5_low = f_security(low, tf_M5)
+M5_open = f_security(open, tf_M5)
+M5_vol = f_security(volume, tf_M5)
+M5_ema9 = f_security(ta.ema(close, ma_fast_len), tf_M5)
+M5_ema20 = f_security(ta.ema(close, ma_mid_len), tf_M5)
+M5_ema50 = f_security(ta.ema(close, ma_slow_len), tf_M5)
+M5_sma200 = f_security(ta.sma(close, ma_very_slow_len), tf_M5)
+M5_vwap = f_security(ta.vwap(hlc3), tf_M5)
+M5_atr14 = f_security(ta.atr(14), tf_M5)
+M5_micro_bull = M5_ema9 > M5_ema20
+M5_micro_bear = M5_ema9 < M5_ema20
+
+small_body_5m = math.abs(M5_close - M5_open) <= (M5_high - M5_low) * small_body_frac
+trigger_up = small_body_5m and M5_close > M5_ema20 and nz(M5_close[1]) <= nz(M5_ema20[1])
+trigger_down = small_body_5m and M5_close < M5_ema20 and nz(M5_close[1]) >= nz(M5_ema20[1])
+
+M1_close = f_security(close, tf_M1)
+M1_open = f_security(open, tf_M1)
+M1_high = f_security(high, tf_M1)
+M1_low = f_security(low, tf_M1)
+M1_ema20 = f_security(ta.ema(close, ma_mid_len), tf_M1)
+small_body_1m = math.abs(M1_close - M1_open) <= (M1_high - M1_low) * small_body_frac
+trigger_up_m1 = small_body_1m and M1_close > M1_ema20 and nz(M1_close[1]) <= nz(M1_ema20[1])
+trigger_dn_m1 = small_body_1m and M1_close < M1_ema20 and nz(M1_close[1]) >= nz(M1_ema20[1])
+
+M5_buf = use_ATR_buffer ? M5_atr14 / 4.0 : M5_close * buffer_pct / 100.0
+M5_swing_low = ta.lowest(M5_low, swing_len_5m)
+M5_swing_high = ta.highest(M5_high, swing_len_5m)
+stop_long = math.min(M5_ema20 - M5_buf, M5_swing_low - M5_buf)
+stop_short = math.max(M5_ema20 + M5_buf, M5_swing_high + M5_buf)
+target_long = M5_swing_high
+target_short = M5_swing_low
+rr_long = (target_long - M5_close) / math.max(M5_close - stop_long, 1e-8)
+rr_short = (M5_close - target_short) / math.max(stop_short - M5_close, 1e-8)
+RR_OK_long = rr_long >= rr_min
+RR_OK_short = rr_short >= rr_min
+
+too_far = math.abs(M5_close - M5_ema20) / M5_ema20 * 100 >= too_far_pct
+
+VOL_OK = switch vol_mode
+    "3of5" =>
+        int count = 0
+        for i = 1 to 5
+            count += M5_vol > nz(M5_vol[i]) ? 1 : 0
+        count >= 3
+    => M5_vol > nz(M5_vol[1]) and M5_vol > nz(M5_vol[2])
+
+trigger_up_final = trigger_up and (not use_m1_trigger or trigger_up_m1)
+trigger_down_final = trigger_down and (not use_m1_trigger or trigger_dn_m1)
+
+cross_up_confirm_long = ta.crossover(M5_ema9, M5_ema20) or ta.crossover(M15_ema_fast, M15_ema_mid)
+cross_dn_confirm_short = ta.crossunder(M5_ema9, M5_ema20) or ta.crossunder(M15_ema_fast, M15_ema_mid)
+
+GREEN = H1_bull and M15_bull and M5_micro_bull and trigger_up_final and VOL_OK and RR_OK_long and not too_far
+RED = H1_bear and M15_bear and M5_micro_bear and trigger_down_final and VOL_OK and RR_OK_short and not too_far
+YELLOW = not (GREEN or RED)
+
+var int position_dir = 0 // 1=long, -1=short
+var float entry_price = na
+var float entry_stop = na
+var float entry_target = na
+var float entry_partial_target = na
+var float risk_R = na
+var int entry_bar_index = na
+var bool hit_half_r = false
+var bool hit_one_r = false
+var bool hit_one_half_r = false
+var line line_one_r = na
+var line line_one_half_r = na
+var label label_one_r = na
+var label label_one_half_r = na
+var label label_exit_note = na
+var int vw_touch_count = 0
+var int ema_touch_count = 0
+string LONG_ID = "Long"
+string SHORT_ID = "Short"
+string LONG_EXIT_ID = "Long Exit"
+string SHORT_EXIT_ID = "Short Exit"
+string LONG_PARTIAL_ID = "Long PT"
+string SHORT_PARTIAL_ID = "Short PT"
+var float rth_high = na
+var float rth_low = na
+var float prev_rth_high = na
+var float prev_rth_low = na
+var float pdh = na
+var float pdl = na
+var float onh = na
+var float onl = na
+var float onh_plot = na
+var float onl_plot = na
+var float ibh = na
+var float ibl = na
+var int session_start_bar = na
+var bool ib_complete = false
+var bool in_session_prev = false
+var line line_pdh = na
+var line line_pdl = na
+var line line_onh = na
+var line line_onl = na
+var line line_ibh = na
+var line line_ibl = na
+var label label_pdh = na
+var label label_pdl = na
+var label label_onh = na
+var label label_onl = na
+var label label_ibh = na
+var label label_ibl = na
+var table status_table = na
+
+clear_trade_visuals() =>
+    if not na(line_one_r)
+        line.delete(line_one_r)
+    if not na(line_one_half_r)
+        line.delete(line_one_half_r)
+    if not na(label_one_r)
+        label.delete(label_one_r)
+    if not na(label_one_half_r)
+        label.delete(label_one_half_r)
+    line_one_r := na
+    line_one_half_r := na
+    label_one_r := na
+    label_one_half_r := na
+
+reset_trade_state() =>
+    clear_trade_visuals()
+    position_dir := 0
+    entry_price := na
+    entry_stop := na
+    entry_target := na
+    entry_partial_target := na
+    risk_R := na
+    entry_bar_index := na
+    hit_half_r := false
+    hit_one_r := false
+    hit_one_half_r := false
+    vw_touch_count := 0
+    ema_touch_count := 0
+    if not na(label_exit_note)
+        label.delete(label_exit_note)
+    label_exit_note := na
+
+ema_fast = ta.ema(close, ma_fast_len)
+ema_mid = ta.ema(close, ma_mid_len)
+ema_slow = ta.ema(close, ma_slow_len)
+sma_very_slow = ta.sma(close, ma_very_slow_len)
+vwap_val = ta.vwap(hlc3)
+
+plot(show_ma_fast ? ema_fast : na, "EMA" + str.tostring(ma_fast_len), color=color_ma_fast, linewidth=2)
+plot(show_ma_mid ? ema_mid : na, "EMA" + str.tostring(ma_mid_len), color=color_ma_mid, linewidth=2)
+plot(show_ma_slow ? ema_slow : na, "EMA" + str.tostring(ma_slow_len), color=color_ma_slow, linewidth=2)
+plot(show_ma_very_slow ? sma_very_slow : na, "SMA" + str.tostring(ma_very_slow_len), color=color_ma_very_slow, linewidth=2)
+plot(show_vwap ? vwap_val : na, "VWAP", color=color_vwap, linewidth=2)
+
+plotshape(show_cross_icons and barstate.isconfirmed and cross_up_confirm_long, title="Cross Up Confirm", style=shape.triangleup, location=location.belowbar, color=color_cross_up, size=size.tiny, text="金叉")
+plotshape(show_cross_icons and barstate.isconfirmed and cross_dn_confirm_short, title="Cross Down Confirm", style=shape.triangledown, location=location.abovebar, color=color_cross_dn, size=size.tiny, text="死叉")
+
+lrc_center = ta.linreg(close, lrc_len, 0)
+lrc_dev = ta.stdev(close - lrc_center, lrc_len)
+lrc_upper = lrc_center + lrc_mult * lrc_dev
+lrc_lower = lrc_center - lrc_mult * lrc_dev
+lrc_slope = lrc_center - nz(lrc_center[1])
+lrc_up_trend = lrc_slope > 0
+
+if show_lrc
+    plot_upper = plot(lrc_upper, "LRC Upper", color=lrc_up_trend ? color.new(color_lrc_up, 0) : color.new(color_lrc_dn, 0), linewidth=1, style=plot.style_line)
+    plot_lower = plot(lrc_lower, "LRC Lower", color=lrc_up_trend ? color.new(color_lrc_up, 0) : color.new(color_lrc_dn, 0), linewidth=1, style=plot.style_line)
+    plot(lrc_center, "LRC Center", color=lrc_up_trend ? color.new(color.blue, 0) : color.new(color.purple, 0), linewidth=1)
+    fill(plot_upper, plot_lower, color=lrc_up_trend ? color_lrc_up : color_lrc_dn)
+
+bool in_session = not na(time(timeframe.period, session_rth))
+bool session_start = in_session and not in_session_prev
+bool session_end = not in_session and in_session_prev
+
+float tf_seconds = timeframe.in_seconds(timeframe.period)
+int ib_bars = tf_seconds > 0 ? math.max(1, math.round(ib_minutes * 60 / tf_seconds)) : 1
+
+if session_end
+    prev_rth_high := rth_high
+    prev_rth_low := rth_low
+    onh := high
+    onl := low
+    onh_plot := na
+    onl_plot := na
+
+if session_start
+    pdh := prev_rth_high
+    pdl := prev_rth_low
+    onh_plot := onh
+    onl_plot := onl
+    rth_high := high
+    rth_low := low
+    session_start_bar := bar_index
+    ibh := high
+    ibl := low
+    ib_complete := false
+else if in_session
+    rth_high := na(rth_high) ? high : math.max(rth_high, high)
+    rth_low := na(rth_low) ? low : math.min(rth_low, low)
+    if not ib_complete
+        if bar_index - session_start_bar < ib_bars
+            ibh := na(ibh) ? high : math.max(ibh, high)
+            ibl := na(ibl) ? low : math.min(ibl, low)
+        else
+            ib_complete := true
+else
+    if not session_end
+        onh := na(onh) ? high : math.max(onh, high)
+        onl := na(onl) ? low : math.min(onl, low)
+
+in_session_prev := in_session
+
+line_style_selected = f_line_style(line_style_levels)
+
+if show_pdh and not na(pdh)
+    if na(line_pdh)
+        line_pdh := line.new(bar_index - 1, pdh, bar_index, pdh, extend=extend.right, color=color_pdh, width=level_linewidth, style=line_style_selected)
+    else
+        line.set_xy1(line_pdh, bar_index - 1, pdh)
+        line.set_xy2(line_pdh, bar_index, pdh)
+        line.set_color(line_pdh, color_pdh)
+        line.set_width(line_pdh, level_linewidth)
+        line.set_style(line_pdh, line_style_selected)
+    if show_labels and (session_start or session_end)
+        if not na(label_pdh)
+            label.delete(label_pdh)
+        label_pdh := label.new(bar_index, pdh, "PDH " + str.tostring(pdh, format.mintick), xloc=xloc.bar_index, color=color.new(color_pdh, 70), textcolor=color.white, style=label.style_label_left)
+else
+    if not na(line_pdh)
+        line.delete(line_pdh)
+        line_pdh := na
+    if not na(label_pdh)
+        label.delete(label_pdh)
+        label_pdh := na
+
+if show_pdl and not na(pdl)
+    if na(line_pdl)
+        line_pdl := line.new(bar_index - 1, pdl, bar_index, pdl, extend=extend.right, color=color_pdl, width=level_linewidth, style=line_style_selected)
+    else
+        line.set_xy1(line_pdl, bar_index - 1, pdl)
+        line.set_xy2(line_pdl, bar_index, pdl)
+        line.set_color(line_pdl, color_pdl)
+        line.set_width(line_pdl, level_linewidth)
+        line.set_style(line_pdl, line_style_selected)
+    if show_labels and (session_start or session_end)
+        if not na(label_pdl)
+            label.delete(label_pdl)
+        label_pdl := label.new(bar_index, pdl, "PDL " + str.tostring(pdl, format.mintick), xloc=xloc.bar_index, color=color.new(color_pdl, 70), textcolor=color.white, style=label.style_label_left)
+else
+    if not na(line_pdl)
+        line.delete(line_pdl)
+        line_pdl := na
+    if not na(label_pdl)
+        label.delete(label_pdl)
+        label_pdl := na
+
+if show_onh and not na(onh_plot)
+    if na(line_onh)
+        line_onh := line.new(bar_index - 1, onh_plot, bar_index, onh_plot, extend=extend.right, color=color_onh, width=level_linewidth, style=line_style_selected)
+    else
+        line.set_xy1(line_onh, bar_index - 1, onh_plot)
+        line.set_xy2(line_onh, bar_index, onh_plot)
+        line.set_color(line_onh, color_onh)
+        line.set_width(line_onh, level_linewidth)
+        line.set_style(line_onh, line_style_selected)
+    if show_labels and session_start
+        if not na(label_onh)
+            label.delete(label_onh)
+        label_onh := label.new(bar_index, onh_plot, "ONH " + str.tostring(onh_plot, format.mintick), xloc=xloc.bar_index, color=color.new(color_onh, 70), textcolor=color.white, style=label.style_label_left)
+else
+    if not na(line_onh)
+        line.delete(line_onh)
+        line_onh := na
+    if not na(label_onh)
+        label.delete(label_onh)
+        label_onh := na
+
+if show_onl and not na(onl_plot)
+    if na(line_onl)
+        line_onl := line.new(bar_index - 1, onl_plot, bar_index, onl_plot, extend=extend.right, color=color_onl, width=level_linewidth, style=line_style_selected)
+    else
+        line.set_xy1(line_onl, bar_index - 1, onl_plot)
+        line.set_xy2(line_onl, bar_index, onl_plot)
+        line.set_color(line_onl, color_onl)
+        line.set_width(line_onl, level_linewidth)
+        line.set_style(line_onl, line_style_selected)
+    if show_labels and session_start
+        if not na(label_onl)
+            label.delete(label_onl)
+        label_onl := label.new(bar_index, onl_plot, "ONL " + str.tostring(onl_plot, format.mintick), xloc=xloc.bar_index, color=color.new(color_onl, 70), textcolor=color.white, style=label.style_label_left)
+else
+    if not na(line_onl)
+        line.delete(line_onl)
+        line_onl := na
+    if not na(label_onl)
+        label.delete(label_onl)
+        label_onl := na
+
+if show_ibh and not na(ibh)
+    if na(line_ibh)
+        line_ibh := line.new(bar_index - 1, ibh, bar_index, ibh, extend=extend.right, color=color_ibh, width=level_linewidth, style=line_style_selected)
+    else
+        line.set_xy1(line_ibh, bar_index - 1, ibh)
+        line.set_xy2(line_ibh, bar_index, ibh)
+        line.set_color(line_ibh, color_ibh)
+        line.set_width(line_ibh, level_linewidth)
+        line.set_style(line_ibh, line_style_selected)
+    if show_labels and (session_start or (in_session and not ib_complete))
+        if not na(label_ibh)
+            label.delete(label_ibh)
+        label_ibh := label.new(bar_index, ibh, "IBH " + str.tostring(ibh, format.mintick), xloc=xloc.bar_index, color=color.new(color_ibh, 70), textcolor=color.white, style=label.style_label_left)
+else
+    if not na(line_ibh)
+        line.delete(line_ibh)
+        line_ibh := na
+    if not na(label_ibh)
+        label.delete(label_ibh)
+        label_ibh := na
+
+if show_ibl and not na(ibl)
+    if na(line_ibl)
+        line_ibl := line.new(bar_index - 1, ibl, bar_index, ibl, extend=extend.right, color=color_ibl, width=level_linewidth, style=line_style_selected)
+    else
+        line.set_xy1(line_ibl, bar_index - 1, ibl)
+        line.set_xy2(line_ibl, bar_index, ibl)
+        line.set_color(line_ibl, color_ibl)
+        line.set_width(line_ibl, level_linewidth)
+        line.set_style(line_ibl, line_style_selected)
+    if show_labels and (session_start or (in_session and not ib_complete))
+        if not na(label_ibl)
+            label.delete(label_ibl)
+        label_ibl := label.new(bar_index, ibl, "IBL " + str.tostring(ibl, format.mintick), xloc=xloc.bar_index, color=color.new(color_ibl, 70), textcolor=color.white, style=label.style_label_left)
+else
+    if not na(line_ibl)
+        line.delete(line_ibl)
+        line_ibl := na
+    if not na(label_ibl)
+        label.delete(label_ibl)
+        label_ibl := na
+
+bool long_signal = barstate.isconfirmed and GREEN and not nz(GREEN[1], false) and position_dir <= 0
+bool short_signal = barstate.isconfirmed and RED and not nz(RED[1], false) and position_dir >= 0
+
+if long_signal
+    if position_dir != 0
+        reset_trade_state()
+    float risk = close - stop_long
+    if risk > 0
+        position_dir := 1
+        entry_price := close
+        entry_stop := stop_long
+        entry_target := target_long
+        entry_partial_target := entry_price + risk_R * 1.5
+        risk_R := risk
+        entry_bar_index := bar_index
+        vw_touch_count := 0
+        ema_touch_count := 0
+        hit_half_r := false
+        hit_one_r := false
+        hit_one_half_r := false
+        clear_trade_visuals()
+        float price_one_r = entry_price + risk_R
+        float price_one_half_r = entry_price + risk_R * 1.5
+        line_one_r := line.new(bar_index, price_one_r, bar_index + 1, price_one_r, extend=extend.right, color=color.new(color.green, 0), width=2)
+        line_one_half_r := line.new(bar_index, price_one_half_r, bar_index + 1, price_one_half_r, extend=extend.right, color=color.new(color.green, 40), width=2)
+        if show_labels
+            label_one_r := label.new(bar_index, price_one_r, "+1R " + str.tostring(price_one_r, format.mintick), xloc=xloc.bar_index, style=label.style_label_right, color=color.new(color.green, 0), textcolor=color.white)
+            label_one_half_r := label.new(bar_index, price_one_half_r, "+1.5R " + str.tostring(price_one_half_r, format.mintick), xloc=xloc.bar_index, style=label.style_label_right, color=color.new(color.green, 50), textcolor=color.white)
+        if use_strategy
+            strategy.entry(LONG_ID, strategy.long, comment="GREEN")
+            float partial_qty = enable_partial ? math.min(math.max(partial_tp_pct, 0.0), 100.0) : 0.0
+            float runner_qty = enable_partial ? math.max(100.0 - partial_qty, 0.0) : 100.0
+            if partial_qty > 0
+                strategy.exit(LONG_PARTIAL_ID, from_entry=LONG_ID, qty_percent=partial_qty, stop=entry_stop, limit=entry_partial_target)
+            if runner_qty > 0
+                strategy.exit(LONG_EXIT_ID, from_entry=LONG_ID, qty_percent=runner_qty, stop=entry_stop, limit=entry_target)
+    else
+        long_signal := false
+
+if short_signal
+    if position_dir != 0
+        reset_trade_state()
+    float risk_s = stop_short - close
+    if risk_s > 0
+        position_dir := -1
+        entry_price := close
+        entry_stop := stop_short
+        entry_target := target_short
+        entry_partial_target := entry_price - risk_R * 1.5
+        risk_R := risk_s
+        entry_bar_index := bar_index
+        vw_touch_count := 0
+        ema_touch_count := 0
+        hit_half_r := false
+        hit_one_r := false
+        hit_one_half_r := false
+        clear_trade_visuals()
+        float price_one_r_short = entry_price - risk_R
+        float price_one_half_r_short = entry_price - risk_R * 1.5
+        line_one_r := line.new(bar_index, price_one_r_short, bar_index + 1, price_one_r_short, extend=extend.right, color=color.new(color.red, 0), width=2)
+        line_one_half_r := line.new(bar_index, price_one_half_r_short, bar_index + 1, price_one_half_r_short, extend=extend.right, color=color.new(color.red, 40), width=2)
+        if show_labels
+            label_one_r := label.new(bar_index, price_one_r_short, "-1R " + str.tostring(price_one_r_short, format.mintick), xloc=xloc.bar_index, style=label.style_label_right, color=color.new(color.red, 0), textcolor=color.white)
+            label_one_half_r := label.new(bar_index, price_one_half_r_short, "-1.5R " + str.tostring(price_one_half_r_short, format.mintick), xloc=xloc.bar_index, style=label.style_label_right, color=color.new(color.red, 50), textcolor=color.white)
+        if use_strategy
+            strategy.entry(SHORT_ID, strategy.short, comment="RED")
+            float partial_qty_s = enable_partial ? math.min(math.max(partial_tp_pct, 0.0), 100.0) : 0.0
+            float runner_qty_s = enable_partial ? math.max(100.0 - partial_qty_s, 0.0) : 100.0
+            if partial_qty_s > 0
+                strategy.exit(SHORT_PARTIAL_ID, from_entry=SHORT_ID, qty_percent=partial_qty_s, stop=entry_stop, limit=entry_partial_target)
+            if runner_qty_s > 0
+                strategy.exit(SHORT_EXIT_ID, from_entry=SHORT_ID, qty_percent=runner_qty_s, stop=entry_stop, limit=entry_target)
+    else
+        short_signal := false
+
+if position_dir != 0
+    int bars_in_trade = bar_index - entry_bar_index
+    float half_r_price = position_dir == 1 ? entry_price + risk_R * half_R : entry_price - risk_R * half_R
+    float one_r_price = position_dir == 1 ? entry_price + risk_R : entry_price - risk_R
+    float one_half_r_price = position_dir == 1 ? entry_price + risk_R * 1.5 : entry_price - risk_R * 1.5
+    bool near_vwap = vwap_val != 0 ? math.abs(close - vwap_val) / vwap_val * 100 < 0.1 : false
+    bool near_ema = ema_mid != 0 ? math.abs(close - ema_mid) / ema_mid * 100 < 0.1 : false
+    if bars_in_trade <= time_stop_bars
+        if near_vwap
+            vw_touch_count += 1
+        if near_ema
+            ema_touch_count += 1
+    if position_dir == 1
+        if not hit_half_r and high >= half_r_price
+            hit_half_r := true
+        if not hit_one_r and high >= one_r_price
+            hit_one_r := true
+        if not hit_one_half_r and high >= one_half_r_price
+            hit_one_half_r := true
+    else
+        if not hit_half_r and low <= half_r_price
+            hit_half_r := true
+        if not hit_one_r and low <= one_r_price
+            hit_one_r := true
+        if not hit_one_half_r and low <= one_half_r_price
+            hit_one_half_r := true
+
+    float dynamic_stop = entry_stop
+    if hit_one_r
+        dynamic_stop := position_dir == 1 ? math.max(entry_price, entry_stop) : math.min(entry_price, entry_stop)
+    if hit_one_half_r
+        if position_dir == 1
+            float ema_trail_long = math.max(M5_ema9, M5_ema20)
+            dynamic_stop := math.max(dynamic_stop, math.min(close, ema_trail_long))
+        else
+            float ema_trail_short = math.min(M5_ema9, M5_ema20)
+            dynamic_stop := math.min(dynamic_stop, math.max(close, ema_trail_short))
+
+    if use_strategy and strategy.position_size != 0
+        float partial_qty_active = enable_partial ? math.min(math.max(partial_tp_pct, 0.0), 100.0) : 0.0
+        float runner_qty_active = enable_partial ? math.max(100.0 - partial_qty_active, 0.0) : 100.0
+        if partial_qty_active > 0
+            strategy.exit(position_dir == 1 ? LONG_PARTIAL_ID : SHORT_PARTIAL_ID, from_entry=position_dir == 1 ? LONG_ID : SHORT_ID, qty_percent=partial_qty_active, stop=dynamic_stop, limit=entry_partial_target)
+        if runner_qty_active > 0
+            strategy.exit(position_dir == 1 ? LONG_EXIT_ID : SHORT_EXIT_ID, from_entry=position_dir == 1 ? LONG_ID : SHORT_ID, qty_percent=runner_qty_active, stop=dynamic_stop, limit=entry_target)
+
+    bool time_stop_trigger = bars_in_trade >= time_stop_bars and (not hit_half_r or vw_touch_count >= 2 or ema_touch_count >= 2)
+
+    if time_stop_trigger and barstate.isconfirmed
+        if show_labels
+            if not na(label_exit_note)
+                label.delete(label_exit_note)
+            label_exit_note := label.new(bar_index, close, "時間止損", xloc=xloc.bar_index, color=color.new(color.yellow, 40), textcolor=color.black, style=label.style_label_down)
+        if use_strategy and strategy.position_size != 0
+            strategy.close(position_dir == 1 ? LONG_ID : SHORT_ID, comment="TimeStop")
+        reset_trade_state()
+    else
+        bool channel_tp = position_dir == 1 ? (exit_on_close ? close >= lrc_upper : high >= lrc_upper) : (exit_on_close ? close <= lrc_lower : low <= lrc_lower)
+        bool channel_sl = position_dir == 1 ? (exit_on_close ? close <= lrc_lower : low <= lrc_lower) : (exit_on_close ? close >= lrc_upper : high >= lrc_upper)
+        if (channel_tp or channel_sl) and barstate.isconfirmed
+            if show_labels
+                if not na(label_exit_note)
+                    label.delete(label_exit_note)
+                string channel_msg = channel_tp ? "通道 TP" : "通道 SL"
+                color channel_color = channel_tp ? color.new(color.blue, 40) : color.new(color.purple, 40)
+                label_exit_note := label.new(bar_index, close, channel_msg, xloc=xloc.bar_index, color=channel_color, textcolor=color.white, style=label.style_label_down)
+            if use_strategy and strategy.position_size != 0
+                strategy.close(position_dir == 1 ? LONG_ID : SHORT_ID, comment=channel_tp ? "LRC_TP" : "LRC_SL")
+            reset_trade_state()
+        else
+        bool hit_stop = position_dir == 1 ? low <= entry_stop : high >= entry_stop
+        bool hit_target = position_dir == 1 ? high >= entry_target : low <= entry_target
+        if (hit_stop or hit_target) and barstate.isconfirmed
+            if show_labels
+                if not na(label_exit_note)
+                    label.delete(label_exit_note)
+                string msg = hit_target ? "達成目標" : "觸發止損"
+                label_exit_note := label.new(bar_index, close, msg, xloc=xloc.bar_index, color=color.new(hit_target ? color.green : color.red, 40), textcolor=color.white, style=label.style_label_down)
+            reset_trade_state()
+
+string long_reasons = ""
+long_reasons := add_reason(long_reasons, H1_bull, "H1 不同向")
+long_reasons := add_reason(long_reasons, not M15_squeeze and M15_bull, "15m 條件未過")
+long_reasons := M15_squeeze ? add_reason(long_reasons, false, "15m 均線纏繞") : long_reasons
+long_reasons := add_reason(long_reasons, M5_micro_bull, "5m 微方向未多頭")
+long_reasons := add_reason(long_reasons, trigger_up_final, "觸發K 未站回20EMA")
+long_reasons := add_reason(long_reasons, VOL_OK, "量能不足")
+long_reasons := add_reason(long_reasons, RR_OK_long, "RR < 門檻")
+long_reasons := add_reason(long_reasons, not too_far, "距離20EMA 過遠")
+long_reasons := use_m1_trigger ? add_reason(long_reasons, trigger_up_m1, "1m 精細觸發未過") : long_reasons
+long_reasons := str.trim(long_reasons)
+
+string short_reasons = ""
+short_reasons := add_reason(short_reasons, H1_bear, "H1 不同向")
+short_reasons := add_reason(short_reasons, not M15_squeeze and M15_bear, "15m 條件未過")
+short_reasons := M15_squeeze ? add_reason(short_reasons, false, "15m 均線纏繞") : short_reasons
+short_reasons := add_reason(short_reasons, M5_micro_bear, "5m 微方向未空頭")
+short_reasons := add_reason(short_reasons, trigger_down_final, "觸發K 未跌回20EMA")
+short_reasons := add_reason(short_reasons, VOL_OK, "量能不足")
+short_reasons := add_reason(short_reasons, RR_OK_short, "RR < 門檻")
+short_reasons := add_reason(short_reasons, not too_far, "距離20EMA 過遠")
+short_reasons := use_m1_trigger ? add_reason(short_reasons, trigger_dn_m1, "1m 精細觸發未過") : short_reasons
+short_reasons := str.trim(short_reasons)
+
+if show_panel
+    if na(status_table)
+        status_table := table.new(position.top_right, 1, 2, border_width=1)
+    string panel_title = GREEN ? "GREEN | 多頭" : RED ? "RED | 空頭" : "YELLOW | 等待"
+    color panel_color = GREEN ? color_green_bg : RED ? color_red_bg : color_yellow_bg
+    string body_text = ""
+    if GREEN
+        body_text := "所有多頭條件通過"
+    else if RED
+        body_text := "所有空頭條件通過"
+    else
+        string long_section = long_reasons == "" ? "—" : long_reasons
+        string short_section = short_reasons == "" ? "—" : short_reasons
+        body_text := "多頭未過項:\n" + long_section + "\n空頭未過項:\n" + short_section
+    table.cell(status_table, 0, 0, panel_title, bgcolor=panel_color, text_color=color.white, text_halign=text.align_center)
+    table.cell(status_table, 0, 1, body_text, bgcolor=color.new(panel_color, 40), text_color=color.white, text_halign=text.align_left)
+else if not na(status_table)
+    table.clear(status_table)
+    status_table := na
